@@ -1,0 +1,245 @@
+# 简化的多平台编译工作流 - 生成可下载的安装包
+# 适用于 fork 仓库，使用标准 GitHub runners，无需额外 secrets
+name: Build Simple
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_channel:
+        description: '发布通道'
+        required: false
+        default: 'stable'
+        type: choice
+        options:
+          - stable
+          - preview
+          - nightly
+          - dev
+  push:
+    branches: [main]
+    tags: ['v*']
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: 0
+  ALLOW_MISSING_LICENSES: 1
+
+jobs:
+  macos-aarch64:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-bundle
+        run: cargo install cargo-bundle --git https://github.com/zed-industries/cargo-bundle.git --branch zed-deploy
+
+      - name: Set channel
+        run: |
+          channel="${{ github.event.inputs.release_channel || 'stable' }}"
+          echo "$channel" > crates/zed/RELEASE_CHANNEL
+          echo "ZED_RELEASE_CHANNEL=$channel" >> $GITHUB_ENV
+
+      - name: Generate licenses
+        run: bash script/generate-licenses
+
+      - name: Build Zed
+        env:
+          ZED_BUNDLE: "true"
+          CXXFLAGS: "-stdlib=libc++"
+        run: |
+          cargo build --release --package zed --package cli --target aarch64-apple-darwin
+          cargo build --release --package remote_server --target aarch64-apple-darwin
+
+      - name: Create bundle
+        run: |
+          cd crates/zed
+          cp Cargo.toml Cargo.toml.bak
+          sed -i.bak "s/package.metadata.bundle-${ZED_RELEASE_CHANNEL}/package.metadata.bundle/" Cargo.toml
+          cargo bundle --release --target aarch64-apple-darwin --select-workspace-root
+          mv Cargo.toml.bak Cargo.toml
+          cd ../..
+
+      - name: Create DMG
+        run: |
+          mkdir -p target/aarch64-apple-darwin/release/dmg
+          app_path=$(find target/aarch64-apple-darwin/release -name "Zed.app" -type d | head -n 1)
+          cp -r "$app_path" target/aarch64-apple-darwin/release/dmg/
+          ln -sf /Applications target/aarch64-apple-darwin/release/dmg/Applications
+          hdiutil create -volname Zed -srcfolder target/aarch64-apple-darwin/release/dmg -ov -format UDZO target/aarch64-apple-darwin/release/Zed-aarch64.dmg
+
+      - name: Package remote_server
+        run: gzip -f --stdout --best target/aarch64-apple-darwin/release/remote_server > target/zed-remote-server-macos-aarch64.gz
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-aarch64
+          path: |
+            target/aarch64-apple-darwin/release/Zed-aarch64.dmg
+            target/zed-remote-server-macos-aarch64.gz
+
+  linux-x86_64:
+    runs-on: ubuntu-22.04
+    env:
+      CC: clang
+      CXX: clang++
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install deps
+        run: bash script/linux
+
+      - name: Set channel
+        run: |
+          channel="${{ github.event.inputs.release_channel || 'stable' }}"
+          echo "$channel" > crates/zed/RELEASE_CHANNEL
+
+      - name: Generate licenses
+        run: bash script/generate-licenses
+
+      - name: Build Zed
+        env:
+          ZED_BUNDLE: "true"
+          RUSTFLAGS: '-C link-args=-Wl,--disable-new-dtags,-rpath,$ORIGIN/../lib'
+        run: |
+          cargo build --release --package zed --package cli
+          cargo build --release --package remote_server
+
+      - name: Create tarball
+        run: |
+          temp_dir=$(mktemp -d)
+          mkdir -p "${temp_dir}/zed.app/bin" "${temp_dir}/zed.app/libexec"
+          cp target/release/zed "${temp_dir}/zed.app/libexec/zed-editor"
+          cp target/release/cli "${temp_dir}/zed.app/bin/zed"
+          tar -czvf target/zed-linux-x86_64.tar.gz -C "${temp_dir}" zed.app
+
+      - name: Package remote_server
+        run: gzip -f --stdout --best target/release/remote_server > target/zed-remote-server-linux-x86_64.gz
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: |
+            target/zed-linux-x86_64.tar.gz
+            target/zed-remote-server-linux-x86_64.gz
+
+  windows-x86_64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Enable long paths (Windows)
+        shell: pwsh
+        run: git config --global core.longpaths true
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Set channel
+        shell: pwsh
+        run: |
+          $channel = "${{ github.event.inputs.release_channel || 'stable' }}"
+          $channel | Set-Content -Path "crates/zed/RELEASE_CHANNEL" -NoNewline
+          $env:ZED_RELEASE_CHANNEL = $channel
+
+      - name: Generate licenses
+        shell: pwsh
+        run: . ./script/generate-licenses.ps1
+
+      - name: Build Zed
+        shell: pwsh
+        run: |
+          $env:ZED_BUNDLE = "true"
+          $target = "x86_64-pc-windows-msvc"
+          rustup target add $target
+          cargo build --release --package zed --package cli --target $target
+          cargo build --release --package remote_server --target $target
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $targetDir = "target\x86_64-pc-windows-msvc\release"
+          $hostDir = "target\release"
+          $zedExe = if (Test-Path "$targetDir\zed.exe") { "$targetDir\zed.exe" } elseif (Test-Path "$hostDir\zed.exe") { "$hostDir\zed.exe" } else { $null }
+          $cliExe = if (Test-Path "$targetDir\cli.exe") { "$targetDir\cli.exe" } elseif (Test-Path "$hostDir\cli.exe") { "$hostDir\cli.exe" } else { $null }
+          $remoteExe = if (Test-Path "$targetDir\remote_server.exe") { "$targetDir\remote_server.exe" } elseif (Test-Path "$hostDir\remote_server.exe") { "$hostDir\remote_server.exe" } else { $null }
+          if (-not $zedExe) { Write-Error "zed.exe not found in $targetDir or $hostDir. Build may have failed."; exit 1 }
+          if (-not $cliExe) { Write-Error "cli.exe not found in $targetDir or $hostDir. Build may have failed."; exit 1 }
+          if (-not $remoteExe) { Write-Error "remote_server.exe not found in $targetDir or $hostDir. Build may have failed."; exit 1 }
+          $out = "${{ github.workspace }}\target\release-packages"
+          New-Item -Path $out -ItemType Directory -Force
+          Copy-Item $zedExe "$out\"
+          Copy-Item $cliExe "$out\cli.exe"
+          Copy-Item $cliExe "$out\zed-cli.exe"
+          Copy-Item "script\install-windows.ps1" "$out\install.ps1"
+          Copy-Item "script\windows-portable-README.txt" "$out\README.txt"
+          Compress-Archive -Path "$out\*" -DestinationPath "target\Zed-windows-x86_64.zip" -Force
+          Compress-Archive -Path $remoteExe -DestinationPath "target\zed-remote-server-windows-x86_64.zip" -Force
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: |
+            target/Zed-windows-x86_64.zip
+            target/zed-remote-server-windows-x86_64.zip
+
+  create_release:
+    needs:
+      - macos-aarch64
+      - linux-x86_64
+      - windows-x86_64
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/macos-aarch64/*
+            artifacts/linux-x86_64/*
+            artifacts/windows-x86_64/*
+          draft: true
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
