@@ -331,15 +331,26 @@ pub fn into_deepseek(
     for message in request.messages {
         for content in message.content {
             match content {
-                MessageContent::Text(text) => messages.push(match message.role {
-                    Role::User => deepseek::RequestMessage::User { content: text },
-                    Role::Assistant => deepseek::RequestMessage::Assistant {
-                        content: Some(text),
-                        tool_calls: Vec::new(),
-                        reasoning_content: current_reasoning.take(),
-                    },
-                    Role::System => deepseek::RequestMessage::System { content: text },
-                }),
+                MessageContent::Text(text) => {
+                    // Skip whitespace-only user messages to avoid errors with OpenAI compatible APIs
+                    // See https://github.com/zed-industries/zed/issues/40097
+                    let should_add = if message.role == Role::User {
+                        !text.trim().is_empty()
+                    } else {
+                        !text.is_empty()
+                    };
+                    if should_add {
+                        messages.push(match message.role {
+                            Role::User => deepseek::RequestMessage::User { content: text },
+                            Role::Assistant => deepseek::RequestMessage::Assistant {
+                                content: Some(text),
+                                tool_calls: Vec::new(),
+                                reasoning_content: current_reasoning.take(),
+                            },
+                            Role::System => deepseek::RequestMessage::System { content: text },
+                        });
+                    }
+                }
                 MessageContent::Thinking { text, .. } => {
                     // Accumulate reasoning content for next assistant message
                     current_reasoning.get_or_insert_default().push_str(&text);
@@ -364,7 +375,9 @@ pub fn into_deepseek(
                         tool_calls.push(tool_call);
                     } else {
                         messages.push(deepseek::RequestMessage::Assistant {
-                            content: None,
+                            // Use empty string instead of None to satisfy DeepSeek API requirements
+                            // when tool_calls are present
+                            content: Some(String::new()),
                             tool_calls: vec![tool_call],
                             reasoning_content: current_reasoning.take(),
                         });
